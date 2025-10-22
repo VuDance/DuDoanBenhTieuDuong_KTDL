@@ -3,44 +3,62 @@ import numpy as np
 from apyori import apriori
 import streamlit as st
 
-# Bước 1: Load và xử lý dữ liệu
-@st.cache_data  # Cache để tăng tốc
+# =============================
+# 1️⃣ Load & Tiền xử lý dữ liệu
+# =============================
+@st.cache_data
 def load_and_preprocess_data():
-    # Load dataset (giả sử file diabetes.csv đã tải từ Kaggle)
     df = pd.read_csv('data/diabetes.csv')
-    
-    # Thay thế 0 ở các cột y tế bằng NaN rồi fill median (xử lý missing values ngầm)
+
+    # Xử lý giá trị 0 -> NaN -> median
     medical_cols = ['Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 'BMI']
     df[medical_cols] = df[medical_cols].replace(0, np.nan)
     df[medical_cols] = df[medical_cols].fillna(df[medical_cols].median())
-    
-    # Rời rạc hóa các đặc trưng (3 bins: low, medium, high)
-    features = ['Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 'BMI', 'DiabetesPedigreeFunction', 'Age']
+
+    # Rời rạc hóa (3 bins: low, medium, high)
+    features = [
+        'Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness', 'Insulin',
+        'BMI', 'DiabetesPedigreeFunction', 'Age'
+    ]
+    bin_edges = {}
     for feature in features:
-        df[f'{feature}_discretized'] = pd.cut(df[feature], bins=3, labels=['low', 'medium', 'high'], duplicates='drop')
-    
-    # Rời rạc hóa Outcome
+        df[f'{feature}_discretized'], edges = pd.cut(
+            df[feature],
+            bins=3,
+            labels=['low', 'medium', 'high'],
+            retbins=True,
+            duplicates='drop'
+        )
+        bin_edges[feature] = edges
+
+    # Outcome
     df['Outcome_discretized'] = df['Outcome'].map({0: 'No_Diabetes', 1: 'Diabetes'})
-    
-    # Tạo transactions: Mỗi row là list các item (tên đặc trưng + giá trị)
+
+    # Tạo transactions
     transactions = []
     for _, row in df.iterrows():
-        transaction = [f'{feat}_{row[f"{feat}_discretized"]}' for feat in features]
-        transaction.append(row['Outcome_discretized'])
-        transactions.append(transaction)
-    
-    return transactions, df
+        t = [f'{feat}_{row[f"{feat}_discretized"]}' for feat in features]
+        t.append(row['Outcome_discretized'])
+        transactions.append(t)
 
-# Bước 2: Áp dụng Apriori để khai phá rules
+    return transactions, df, bin_edges
+
+
+# =============================
+# 2️⃣ Áp dụng Apriori để khai phá luật
+# =============================
 @st.cache_data
-def mine_rules(transactions):
-    # Chạy Apriori: min_support=0.1, min_confidence=0.5, min_lift=1.0
-    rules = apriori(transactions, min_support=0.1, min_confidence=0.5, min_lift=1.0, min_length=2)
-    
-    # Chuyển rules thành DataFrame để dễ xem
+def mine_rules(transactions, min_support=0.1, min_conf=0.6):
+    rules = apriori(
+        transactions,
+        min_support=min_support,
+        min_confidence=min_conf,
+        min_lift=1.0,
+        min_length=2
+    )
+
     results = []
     for rule in rules:
-        # rule là một RelationRecord, chứa items, support và ordered_statistics
         support = rule.support
         for ordered_stat in rule.ordered_statistics:
             antecedent = ', '.join(list(ordered_stat.items_base))
@@ -48,60 +66,82 @@ def mine_rules(transactions):
             confidence = ordered_stat.confidence
             lift = ordered_stat.lift
             results.append([antecedent, consequent, support, confidence, lift])
-    
-    rules_df = pd.DataFrame(results, columns=['Antecedent', 'Consequent', 'Support', 'Confidence', 'Lift'])
-    # Lọc rules liên quan đến Diabetes
+
+    rules_df = pd.DataFrame(
+        results, columns=['Antecedent', 'Consequent', 'Support', 'Confidence', 'Lift']
+    )
+
+    # Chia rule cho 2 loại kết luận
     diabetes_rules = rules_df[rules_df['Consequent'] == 'Diabetes']
-    return diabetes_rules.sort_values('Confidence', ascending=False)
+    no_diabetes_rules = rules_df[rules_df['Consequent'] == 'No_Diabetes']
+    return diabetes_rules, no_diabetes_rules, rules_df
 
-# Bước 3: Hàm dự đoán dựa trên rules
-def predict_diabetes(input_data, diabetes_rules, threshold=0.7):
+
+# =============================
+# 3️⃣ Dự đoán theo luật
+# =============================
+def predict_diabetes(input_data, diabetes_rules, no_diabetes_rules, bin_edges, threshold=0.7):
+    features = [
+        'Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness', 'Insulin',
+        'BMI', 'DiabetesPedigreeFunction', 'Age'
+    ]
+
     discretized_input = {}
-    features = ['Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 'BMI', 'DiabetesPedigreeFunction', 'Age']
     for i, feat in enumerate(features):
-        # Use pd.cut and extract the first category directly
-        discretized_input[f'{feat}_discretized'] = pd.cut([input_data[i]], bins=3, labels=['low', 'medium', 'high'])[0]
-    
+        discretized_input[f'{feat}_discretized'] = pd.cut(
+            [input_data[i]], bins=bin_edges[feat], labels=['low', 'medium', 'high']
+        )[0]
+
     input_transaction = [f'{feat}_{discretized_input[f"{feat}_discretized"]}' for feat in features]
-    
-    matching_rules = []
-    for _, rule in diabetes_rules.iterrows():
-        antecedent_items = rule['Antecedent'].split(', ')
-        if all(item in input_transaction for item in antecedent_items):
-            matching_rules.append(rule['Confidence'])
-    
-    if matching_rules:
-        max_conf = max(matching_rules)
-        if max_conf >= threshold:
-            return f"Có nguy cơ tiểu đường"
-        else:
-            return f"Nguy cơ thấp tiểu đường"
+
+    def get_max_conf(rules):
+        confs = []
+        for _, rule in rules.iterrows():
+            antecedent_items = rule['Antecedent'].split(', ')
+            if all(item in input_transaction for item in antecedent_items):
+                confs.append(rule['Confidence'])
+        return max(confs) if confs else 0
+
+    conf_pos = get_max_conf(diabetes_rules)
+    conf_neg = get_max_conf(no_diabetes_rules)
+
+    # So sánh confidence giữa 2 nhóm rule
+    if conf_pos >= threshold and conf_pos > conf_neg:
+        return f"🩸 Có nguy cơ TIỂU ĐƯỜNG (conf={conf_pos:.2f})"
+    elif conf_neg >= threshold and conf_neg > conf_pos:
+        return f"✅ Nguy cơ thấp (Không bệnh) (conf={conf_neg:.2f})"
     else:
-        return "Không phát hiện nguy cơ"
+        return f"🤔 Không xác định rõ (conf_pos={conf_pos:.2f}, conf_neg={conf_neg:.2f})"
 
-# Streamlit App
+
+# =============================
+# 4️⃣ Streamlit UI
+# =============================
 def main():
-    st.title("Ứng Dụng Chẩn Đoán Bệnh Tiểu Đường Với Apriori")
-    st.write("Dựa trên dataset Pima Indians Diabetes. Nhập dữ liệu để dự đoán nguy cơ tiểu đường.")
+    st.set_page_config(page_title="Chẩn đoán Tiểu Đường - Apriori", page_icon="🩺", layout="centered")
+    st.title("🩺 Ứng Dụng Chẩn Đoán Bệnh Tiểu Đường (Apriori)")
+    st.caption("Dựa trên dataset Pima Indians Diabetes (Kaggle)")
 
-    # Load data và rules
-    with st.spinner('Đang xử lý dữ liệu và khai phá rules...'):
-        transactions, df = load_and_preprocess_data()
-        diabetes_rules = mine_rules(transactions)
+    # Load data & rules
+    with st.spinner("🔄 Đang xử lý dữ liệu và khai phá luật..."):
+        transactions, df, bin_edges = load_and_preprocess_data()
+        diabetes_rules, no_diabetes_rules, rules_df = mine_rules(transactions)
 
-    # Hiển thị thống kê dataset
-    st.subheader("Thống Kê Dataset")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Số bệnh nhân", len(df))
-    col2.metric("Tỷ lệ tiểu đường", f"{df['Outcome'].mean():.1%}")
-    col3.metric("Số rules Diabetes", len(diabetes_rules))
+    # Hiển thị thống kê
+    st.subheader("📊 Thống kê dữ liệu")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Số bệnh nhân", len(df))
+    c2.metric("Tỷ lệ tiểu đường", f"{df['Outcome'].mean():.1%}")
+    c3.metric("Tổng số luật", len(rules_df))
 
-    # Hiển thị top rules
-    st.subheader("Top 5 Rules Liên Quan Đến Tiểu Đường (Confidence cao nhất)")
-    st.dataframe(diabetes_rules.head(5))
+    st.subheader("🏷️ Top 5 Luật Tiểu Đường (Confidence cao)")
+    st.dataframe(diabetes_rules.sort_values("Confidence", ascending=False).head(5))
 
-    # Input form cho dự đoán
-    st.subheader("Nhập Thông Tin Bệnh Nhân")
+    st.subheader("🏷️ Top 5 Luật Không Bệnh (Confidence cao)")
+    st.dataframe(no_diabetes_rules.sort_values("Confidence", ascending=False).head(5))
+
+    # Input form
+    st.subheader("🧍‍♀️ Nhập Thông Tin Bệnh Nhân")
     feature_labels = {
         'Pregnancies': 'Số lần mang thai',
         'Glucose': 'Nồng độ glucose (mg/dL)',
@@ -112,25 +152,31 @@ def main():
         'DiabetesPedigreeFunction': 'Chỉ số di truyền tiểu đường',
         'Age': 'Tuổi (năm)'
     }
+
+    # Giá trị mặc định “không bệnh”
     default_values = {
-        'Pregnancies': 6,
-        'Glucose': 148,
-        'BloodPressure': 72,
-        'SkinThickness': 35,
-        'Insulin': 0,
-        'BMI': 33.6,
-        'DiabetesPedigreeFunction': 0.627,
-        'Age': 50
+        'Pregnancies': 1,
+        'Glucose': 90,
+        'BloodPressure': 70,
+        'SkinThickness': 25,
+        'Insulin': 80,
+        'BMI': 24.5,
+        'DiabetesPedigreeFunction': 0.35,
+        'Age': 25
     }
+
     input_data = []
     for feat in feature_labels.keys():
-        input_data.append(st.number_input(f"{feature_labels[feat]}", min_value=0.0, value=float(default_values[feat]), step=0.1))
+        input_data.append(
+            st.number_input(feature_labels[feat], min_value=0.0, value=float(default_values[feat]), step=0.1)
+        )
 
-    threshold = st.slider("Ngưỡng độ tin cậy để dự đoán", 0.5, 1.0, 0.56)
+    threshold = st.slider("Ngưỡng độ tin cậy để kết luận", 0.5, 1.0, 0.7)
 
-    if st.button("Dự đoán"):
-        prediction = predict_diabetes(input_data, diabetes_rules, threshold)
-        st.success(prediction)
+    if st.button("🔍 Dự đoán"):
+        result = predict_diabetes(input_data, diabetes_rules, no_diabetes_rules, bin_edges, threshold)
+        st.success(result)
+
 
 if __name__ == "__main__":
     main()
